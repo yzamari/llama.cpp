@@ -111,6 +111,19 @@ int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
+// TurboQuant attention provider hook. Default-NULL global; the custom
+// ggml op consults it via llama_get_turboquant_attn_fn() when a
+// TurboQuant K/V cache is active. No-op when unregistered.
+static llama_turboquant_attn_fn g_tq_attn_fn = nullptr;
+
+void llama_set_turboquant_attn_fn(llama_turboquant_attn_fn fn) {
+    g_tq_attn_fn = fn;
+}
+
+llama_turboquant_attn_fn llama_get_turboquant_attn_fn(void) {
+    return g_tq_attn_fn;
+}
+
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static int llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model & model, llama_model_params & params) {
