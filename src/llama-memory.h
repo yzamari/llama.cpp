@@ -20,6 +20,11 @@ struct llama_memory_params {
 
     // use full-size SWA cache
     bool swa_full;
+
+    // route the KV cache through TurboQuant (PolarQuant + 1-bit QJL).
+    // when true, type_k/type_v are ignored and the model factory instantiates
+    // llama_kv_cache_turboquant. fork-only field; not present in upstream.
+    bool turboquant;
 };
 
 enum llama_memory_status {

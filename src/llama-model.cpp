@@ -10,6 +10,7 @@
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache-turboquant.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -8545,20 +8546,43 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
-                        res = new llama_kv_cache(
-                                *this,
-                                params.type_k,
-                                params.type_v,
-                                !cparams.flash_attn,
-                                cparams.offload_kqv,
-                                cparams.kv_unified,
-                                cparams.n_ctx_seq,
-                                cparams.n_seq_max,
-                                1,
-                                hparams.n_swa,
-                                hparams.swa_type,
-                                nullptr,
-                                nullptr);
+                        // TurboQuant fork: when params.turboquant is set, the
+                        // factory returns the derived TurboQuant cache. The
+                        // class is currently a thin tag over llama_kv_cache —
+                        // the algorithmic substitution (PolarQuant + QJL on
+                        // K/V, custom attention op) lands in a follow-up
+                        // commit without further plumbing churn.
+                        if (params.turboquant) {
+                            res = new llama_kv_cache_turboquant(
+                                    *this,
+                                    params.type_k,
+                                    params.type_v,
+                                    !cparams.flash_attn,
+                                    cparams.offload_kqv,
+                                    cparams.kv_unified,
+                                    cparams.n_ctx_seq,
+                                    cparams.n_seq_max,
+                                    1,
+                                    hparams.n_swa,
+                                    hparams.swa_type,
+                                    nullptr,
+                                    nullptr);
+                        } else {
+                            res = new llama_kv_cache(
+                                    *this,
+                                    params.type_k,
+                                    params.type_v,
+                                    !cparams.flash_attn,
+                                    cparams.offload_kqv,
+                                    cparams.kv_unified,
+                                    cparams.n_ctx_seq,
+                                    cparams.n_seq_max,
+                                    1,
+                                    hparams.n_swa,
+                                    hparams.swa_type,
+                                    nullptr,
+                                    nullptr);
+                        }
                     }
                 }
             }
