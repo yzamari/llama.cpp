@@ -972,6 +972,17 @@ extern "C" {
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 
+    // TurboQuant attention provider hook (PolarQuant + 1-bit QJL).
+    // The function is invoked by the custom ggml op when a TurboQuant cache
+    // is in use. Pass NULL to deregister. Caller owns the function pointer.
+    typedef void (*llama_turboquant_attn_fn)(
+        const float * q, const float * k, const float * v,
+        int BH, int n_q, int n_kv, int D,
+        float scale, const float * mask, float * out);
+
+    LLAMA_API void llama_set_turboquant_attn_fn(llama_turboquant_attn_fn fn);
+    LLAMA_API llama_turboquant_attn_fn llama_get_turboquant_attn_fn(void);
+
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases
