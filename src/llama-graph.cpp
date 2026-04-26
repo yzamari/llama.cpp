@@ -7,6 +7,7 @@
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache-turboquant.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -17,6 +18,25 @@
 #include <numeric>
 #include <sstream>
 #include <unordered_set>
+
+// TurboQuant fork: forward decl of the custom ggml op implemented in
+// ggml/src/ggml-custom-turboquant.c (compiled into libllama). Keeps the
+// op's storage out of libggml-base which must stay algorithm-agnostic.
+extern "C" {
+    struct ggml_turboquant_userdata {
+        float scale;
+        const float * mask;
+        int n_q_mask;
+        int n_kv_mask;
+    };
+
+    void ggml_custom_op_turboquant_attn(
+            struct ggml_tensor * dst,
+            const struct ggml_tensor * q,
+            const struct ggml_tensor * k,
+            const struct ggml_tensor * v,
+            int ith, int nth, void * userdata);
+}
 
 // dedup helpers
 
@@ -1943,6 +1963,50 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
+
+    // TurboQuant fork: if the active KV cache is TurboQuant and flash-attn
+    // is off, replace the Q@K.T -> softmax -> attn@V triple with a single
+    // ggml_map_custom3 op that forwards to llama_get_turboquant_attn_fn().
+    // Branching here, before the view_4d/permute, lets the custom op work
+    // on the un-permuted [D, n_head, n_tokens] / [D, n_kv, n_head_kv]
+    // layouts that match the playbook's tensor table, and skips the v_trans
+    // / streaming bookkeeping which doesn't apply to the v1 cut.
+    if (!cparams.flash_attn && kq_b == nullptr && n_stream == 1) {
+        const auto * mctx_kv = dynamic_cast<const llama_kv_cache_context *>(mctx);
+        if (mctx_kv != nullptr) {
+            const auto * kv_tq = dynamic_cast<const llama_kv_cache_turboquant *>(mctx_kv->get_kv());
+            if (kv_tq != nullptr) {
+                // Allocate userdata in the graph's ggml context so it lives
+                // until compute. ggml_new_buffer is the public spelling of
+                // GGML_OBJECT_TYPE_WORK_BUFFER allocation.
+                auto * ud = (struct ggml_turboquant_userdata *)
+                    ggml_new_buffer(ctx0, sizeof(struct ggml_turboquant_userdata));
+                ud->scale = kq_scale;
+                ud->mask = (kq_mask && kq_mask->data) ? (const float *) kq_mask->data : nullptr;
+                ud->n_q_mask  = kq_mask ? (int) kq_mask->ne[1] : 0;
+                ud->n_kv_mask = kq_mask ? (int) kq_mask->ne[0] : 0;
+
+                ggml_tensor * cur_tq = ggml_map_custom3(
+                        ctx0, q, k, v,
+                        ggml_custom_op_turboquant_attn,
+                        GGML_N_TASKS_MAX, ud);
+                cb(cur_tq, "kqv_turboquant", il);
+
+                // Match the shape contract of the standard branch: a 2D
+                // tensor [n_embd_head_v * n_head, n_tokens]. The custom op
+                // produces dst with q's shape [D, n_head, n_tokens], so a
+                // reshape_2d is enough — no permute, since q is already in
+                // (D, n_head, n_tokens) order which matches the standard
+                // branch's `cur = ggml_permute(kqv, 0, 2, 1, 3)` output.
+                cur_tq = ggml_reshape_2d(ctx0, cur_tq,
+                                         cur_tq->ne[0] * cur_tq->ne[1],
+                                         cur_tq->ne[2]);
+
+                ggml_build_forward_expand(gf, cur_tq);
+                return cur_tq;
+            }
+        }
+    }
 
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
 

@@ -38,6 +38,12 @@ add_library(llama
             unicode-data.cpp
             unicode.cpp
             unicode.h
+            # TurboQuant fork: custom ggml op that forwards Q/K/V to a
+            # registered TurboQuant attention provider. Source lives under
+            # ggml/src/ for symmetry with other ggml-* files but is compiled
+            # into libllama because it depends on a llama.h symbol; libggml
+            # must stay algorithm-agnostic.
+            ../ggml/src/ggml-custom-turboquant.c
             ${LLAMA_MODELS_SOURCES}
             )
 
