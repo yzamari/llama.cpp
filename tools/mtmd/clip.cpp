@@ -168,7 +168,21 @@ struct clip_ctx {
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
         }
-        if (ctx_params.use_gpu) {
+
+        // Phase 1 (Path C — mtmd-on-OpenCL): kill switch.
+        //
+        // Setting MTMD_VISION_GPU_DISABLE to any non-empty value forces the
+        // vision tower to run on CPU even if a GPU backend is available.
+        // Used for testing the CPU baseline and as a fallback for SoCs whose
+        // OpenCL driver hangs on the SigLIP graph (currently Adreno 740 — see
+        // the explicit per-SoC bypass below).
+        const char * mtmd_vision_gpu_disable = std::getenv("MTMD_VISION_GPU_DISABLE");
+        const bool   gpu_force_disabled      = (mtmd_vision_gpu_disable != nullptr && mtmd_vision_gpu_disable[0] != '\0');
+        if (gpu_force_disabled) {
+            LOG_INF("%s: MTMD_VISION_GPU_DISABLE is set, forcing CPU backend for vision tower\n", __func__);
+        }
+
+        if (ctx_params.use_gpu && !gpu_force_disabled) {
             auto backend_name = std::getenv("MTMD_BACKEND_DEVICE");
             if (backend_name != nullptr) {
                 backend = ggml_backend_init_by_name(backend_name, nullptr);
@@ -180,12 +194,38 @@ struct clip_ctx {
                 backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
                 backend = backend ? backend : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
             }
+
+            // Phase 1 (Path C — mtmd-on-OpenCL): Adreno 740 SoC bypass.
+            //
+            // The SigLIP vision graph deadlocks on the Adreno 740 OpenCL
+            // driver (Tab S9+ kalama). The ggml-opencl backend lumps Adreno
+            // 730 / 740 / 750 together as "A7X", but only the 740 hangs, so
+            // we differentiate by the device description string here. The
+            // S24 Ultra (Adreno 750) keeps GPU. See
+            // docs/path-c-mtmd-opencl-design.md Phase 1.
+            if (backend) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+                const char * dev_desc  = dev ? ggml_backend_dev_description(dev) : nullptr;
+                if (dev_desc && strstr(dev_desc, "740") != nullptr) {
+                    LOG_INF("%s: detected Adreno 740 (%s) — vision tower forced to CPU (known OpenCL hang)\n",
+                            __func__, dev_desc);
+                    ggml_backend_free(backend);
+                    backend = nullptr;
+                }
+            }
         }
 
         if (backend) {
             LOG_INF("%s: CLIP using %s backend\n", __func__, ggml_backend_name(backend));
-            backend_ptrs.push_back(backend);
-            backend_buft.push_back(ggml_backend_get_default_buffer_type(backend));
+            // Phase 1 (Path C — mtmd-on-OpenCL): GPU goes to index 0 of the
+            // scheduler's backend list so it is the preferred placement
+            // target for vision-graph nodes; CPU is appended below as the
+            // fallback. The previous order accidentally inverted this on
+            // some code paths because backend_ptrs was empty at this point
+            // and the GPU push happened before the CPU push — preserve the
+            // invariant explicitly so future refactors don't regress it.
+            backend_ptrs.insert(backend_ptrs.begin(), backend);
+            backend_buft.insert(backend_buft.begin(), ggml_backend_get_default_buffer_type(backend));
         } else {
             backend = backend_cpu;
             LOG_INF("%s: CLIP using CPU backend\n", __func__);
