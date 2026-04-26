@@ -348,6 +348,12 @@ public:
     // llama_kv_cache_context specific API
     //
 
+    // TurboQuant fork: expose the underlying cache so the graph builder can
+    // detect llama_kv_cache_turboquant via dynamic_cast and branch the
+    // attention triple to a custom ggml op. Upstream does not need this; the
+    // cache type is otherwise opaque to graph code.
+    const llama_kv_cache * get_kv() const { return kv; }
+
     uint32_t get_n_kv() const;
 
     ggml_type type_k() const;
