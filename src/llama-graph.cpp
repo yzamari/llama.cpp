@@ -22,19 +22,18 @@
 // TurboQuant fork: forward decl of the custom ggml op implemented in
 // ggml/src/ggml-custom-turboquant.c (compiled into libllama). Keeps the
 // op's storage out of libggml-base which must stay algorithm-agnostic.
+//
+// We use ggml_custom_4d so that q/k/v AND kq_mask are all registered as
+// graph dependencies (dst->src[0..3]). Routing kq_mask in this way is
+// what keeps the graph allocator from orphaning its input buffer; without
+// it, llama_kv_cache::set_input_kq_mask faults at decode time.
 extern "C" {
     struct ggml_turboquant_userdata {
         float scale;
-        const float * mask;
-        int n_q_mask;
-        int n_kv_mask;
     };
 
     void ggml_custom_op_turboquant_attn(
             struct ggml_tensor * dst,
-            const struct ggml_tensor * q,
-            const struct ggml_tensor * k,
-            const struct ggml_tensor * v,
             int ith, int nth, void * userdata);
 }
 
@@ -1966,11 +1965,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     // TurboQuant fork: if the active KV cache is TurboQuant and flash-attn
     // is off, replace the Q@K.T -> softmax -> attn@V triple with a single
-    // ggml_map_custom3 op that forwards to llama_get_turboquant_attn_fn().
+    // ggml_custom_4d op that forwards to llama_get_turboquant_attn_fn().
     // Branching here, before the view_4d/permute, lets the custom op work
     // on the un-permuted [D, n_head, n_tokens] / [D, n_kv, n_head_kv]
     // layouts that match the playbook's tensor table, and skips the v_trans
     // / streaming bookkeeping which doesn't apply to the v1 cut.
+    //
+    // The mask tensor is passed as the 4th src so the graph allocator
+    // allocates its input buffer; the original `ggml_map_custom3` only
+    // wired q/k/v which left kq_mask as an unconsumed input → null buffer
+    // at decode → fault in set_input_kq_mask. The custom op reads the
+    // mask data at execute time via dst->src[3]->data, not here at
+    // graph-build time.
     if (!cparams.flash_attn && kq_b == nullptr && n_stream == 1) {
         const auto * mctx_kv = dynamic_cast<const llama_kv_cache_context *>(mctx);
         if (mctx_kv != nullptr) {
@@ -1982,12 +1988,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 auto * ud = (struct ggml_turboquant_userdata *)
                     ggml_new_buffer(ctx0, sizeof(struct ggml_turboquant_userdata));
                 ud->scale = kq_scale;
-                ud->mask = (kq_mask && kq_mask->data) ? (const float *) kq_mask->data : nullptr;
-                ud->n_q_mask  = kq_mask ? (int) kq_mask->ne[1] : 0;
-                ud->n_kv_mask = kq_mask ? (int) kq_mask->ne[0] : 0;
 
-                ggml_tensor * cur_tq = ggml_map_custom3(
-                        ctx0, q, k, v,
+                ggml_tensor * args[4] = { q, k, v, kq_mask };
+                const int n_args = (kq_mask != nullptr) ? 4 : 3;
+
+                ggml_tensor * cur_tq = ggml_custom_4d(
+                        ctx0,
+                        GGML_TYPE_F32,
+                        q->ne[0], q->ne[1], q->ne[2], q->ne[3],
+                        args, n_args,
                         ggml_custom_op_turboquant_attn,
                         GGML_N_TASKS_MAX, ud);
                 cb(cur_tq, "kqv_turboquant", il);
