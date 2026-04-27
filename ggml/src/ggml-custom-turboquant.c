@@ -83,19 +83,21 @@ static inline float tq_read_elem(const struct ggml_tensor * t, size_t off_bytes)
 // We therefore (a) cast F16 -> F32 inline, (b) permute via nb-aware reads
 // to the packed layout, (c) replicate K/V across the GQA group.
 //
-// The dispatcher calls this nth times (once per worker), so we guard
-// ith != 0 and run the whole op single-threaded for the v1 cut.
+// **Multi-threaded by BH.** ggml's CPU dispatcher calls this function
+// once per worker thread with ith ∈ [0, nth). Each thread handles a
+// disjoint slice of BH, packs Q/K/V for its slice, calls the provider
+// with the slice's BH count, and writes its slice of dst. dst slices
+// are disjoint along the n_head axis, so no synchronization is needed.
 void ggml_custom_op_turboquant_attn(
         struct ggml_tensor * dst,
         int ith, int nth, void * userdata) {
-    (void) nth;
-    if (ith != 0) {
-        return;
-    }
-
     const llama_turboquant_attn_fn fn = llama_get_turboquant_attn_fn();
     if (fn == NULL) {
-        memset(dst->data, 0, ggml_nbytes(dst));
+        // No provider registered. Only ith=0 zeroes the full output —
+        // other workers no-op so we don't double-write.
+        if (ith == 0) {
+            memset(dst->data, 0, ggml_nbytes(dst));
+        }
         return;
     }
 
@@ -117,16 +119,14 @@ void ggml_custom_op_turboquant_attn(
     const int n_head = (int) q->ne[1];
     const int n_q    = (int) q->ne[2];
 
-    // K cache layout: [D, n_head_kv, n_kv, 1]  (NOT n_kv before n_head_kv —
-    // get_k() returns it permuted this way; see llama_kv_cache::get_k).
+    // K cache layout: [D, n_head_kv, n_kv, 1]
     const int n_head_kv = (int) k->ne[1];
     const int n_kv      = (int) k->ne[2];
 
     GGML_ASSERT(D == (int) k->ne[0] && "TurboQuant op: q and k must share D");
 
-    // V layout depends on v_trans, set by attn_v_trans = !cparams.flash_attn
-    // at cache construction. We always run with flash_attn=false here so
-    // v_trans is true, but we still detect via stride to stay robust.
+    // V layout depends on v_trans (set by attn_v_trans = !cparams.flash_attn
+    // at cache construction; always true on our path since we force flash off).
     const int v_trans = (v->nb[1] > v->nb[2]) ? 1 : 0;
     if (v_trans) {
         GGML_ASSERT((int) v->ne[0] == n_kv);
@@ -142,14 +142,33 @@ void ggml_custom_op_turboquant_attn(
     const int gqa = n_head / n_head_kv;
     const int BH  = n_head_kv * gqa;  // == n_head
 
-    // ---- Pack Q: [D, n_head, n_q] -> [BH, n_q, D] ----
-    // For GQA, BH == n_head so this is a (h, t) -> (t, h) swap with element-
-    // level conversion. Q's strides are q->nb[0]/[1]/[2].
-    float * q_buf = (float *) malloc((size_t) BH * n_q * D * sizeof(float));
+    // ---- Per-thread BH partition ----
+    // bh ∈ [bh_start, bh_end) is this worker's slice. The mapping bh -> hkv
+    // is bh / gqa; each bh corresponds to one Q head and one (replicated)
+    // KV head. dst slices along n_head are disjoint per thread, so no
+    // synchronization is needed when writing back.
+    const int bh_start = (BH * ith) / nth;
+    const int bh_end   = (BH * (ith + 1)) / nth;
+    const int bh_count = bh_end - bh_start;
+    if (bh_count <= 0) {
+        return; // nth > BH: extra threads no-op
+    }
+
+    // Mask. F32, contiguous, shared read-only across threads.
+    const float * mask_data = NULL;
+    if (kq_mask != NULL && kq_mask->data != NULL) {
+        GGML_ASSERT(kq_mask->type == GGML_TYPE_F32 && "TurboQuant op: kq_mask must be F32");
+        mask_data = (const float *) kq_mask->data;
+    }
+
+    // ---- Pack Q slice: q[D, n_head, n_q] -> q_buf[bh_count, n_q, D] ----
+    // For GQA, the bh index IS the head index, so this is straightforward.
+    float * q_buf = (float *) malloc((size_t) bh_count * n_q * D * sizeof(float));
     GGML_ASSERT(q_buf && "TurboQuant op: q_buf alloc failed");
     for (int t = 0; t < n_q; ++t) {
-        for (int h = 0; h < n_head; ++h) {
-            float * row = q_buf + ((size_t) h * n_q + t) * D;
+        for (int bh = bh_start; bh < bh_end; ++bh) {
+            const int h = bh; // 1:1 for GQA folded layout
+            float * row = q_buf + ((size_t) (bh - bh_start) * n_q + t) * D;
             for (int d = 0; d < D; ++d) {
                 const size_t off = (size_t) d * q->nb[0]
                                  + (size_t) h * q->nb[1]
@@ -159,86 +178,90 @@ void ggml_custom_op_turboquant_attn(
         }
     }
 
-    // ---- Pack K: cache[D, n_head_kv, n_kv] -> k_buf[BH, n_kv, D] ----
-    // Replicate each KV head `gqa` times along BH.
-    float * k_buf = (float *) malloc((size_t) BH * n_kv * D * sizeof(float));
+    // ---- Pack K slice: k[D, n_head_kv, n_kv] -> k_buf[bh_count, n_kv, D] ----
+    // bh -> hkv = bh / gqa. Multiple bh values within the same hkv group
+    // share the same K vector (GQA replication).
+    float * k_buf = (float *) malloc((size_t) bh_count * n_kv * D * sizeof(float));
     GGML_ASSERT(k_buf && "TurboQuant op: k_buf alloc failed");
-    for (int hkv = 0; hkv < n_head_kv; ++hkv) {
+    {
+        int last_hkv = -1;
+        float src[1024];
+        GGML_ASSERT(D <= (int) (sizeof(src) / sizeof(src[0])) && "TurboQuant op: D exceeds local buf");
         for (int kt = 0; kt < n_kv; ++kt) {
-            // Read one [D]-vector once, then duplicate across the GQA group.
-            float src[1024];
-            GGML_ASSERT(D <= (int) (sizeof(src) / sizeof(src[0])) && "TurboQuant op: D exceeds local buf");
-            for (int d = 0; d < D; ++d) {
-                const size_t off = (size_t) d   * k->nb[0]
-                                 + (size_t) hkv * k->nb[1]
-                                 + (size_t) kt  * k->nb[2];
-                src[d] = tq_read_elem(k, off);
-            }
-            for (int g = 0; g < gqa; ++g) {
-                const int bh = hkv * gqa + g;
-                memcpy(k_buf + ((size_t) bh * n_kv + kt) * D, src, (size_t) D * sizeof(float));
-            }
-        }
-    }
-
-    // ---- Pack V: cache layout depends on v_trans ----
-    //   v_trans=true  : v[kt, hkv, d]  reading kt*nb[0] + hkv*nb[1] + d*nb[2]
-    //   v_trans=false : v[d,  hkv, kt] reading d*nb[0]  + hkv*nb[1] + kt*nb[2]
-    // Output v_buf[BH, n_kv, D] in either case.
-    float * v_buf = (float *) malloc((size_t) BH * n_kv * D * sizeof(float));
-    GGML_ASSERT(v_buf && "TurboQuant op: v_buf alloc failed");
-    for (int hkv = 0; hkv < n_head_kv; ++hkv) {
-        for (int kt = 0; kt < n_kv; ++kt) {
-            float src[1024];
-            for (int d = 0; d < D; ++d) {
-                size_t off;
-                if (v_trans) {
-                    off = (size_t) kt  * v->nb[0]
-                        + (size_t) hkv * v->nb[1]
-                        + (size_t) d   * v->nb[2];
-                } else {
-                    off = (size_t) d   * v->nb[0]
-                        + (size_t) hkv * v->nb[1]
-                        + (size_t) kt  * v->nb[2];
+            // Read K vector once per hkv-kt; replicate across the bh values
+            // in our slice that map to that hkv. We walk bh in our slice in
+            // order; an hkv can repeat for `gqa` consecutive bh values.
+            last_hkv = -1;
+            for (int bh = bh_start; bh < bh_end; ++bh) {
+                const int hkv = bh / gqa;
+                if (hkv != last_hkv) {
+                    for (int d = 0; d < D; ++d) {
+                        const size_t off = (size_t) d   * k->nb[0]
+                                         + (size_t) hkv * k->nb[1]
+                                         + (size_t) kt  * k->nb[2];
+                        src[d] = tq_read_elem(k, off);
+                    }
+                    last_hkv = hkv;
                 }
-                src[d] = tq_read_elem(v, off);
-            }
-            for (int g = 0; g < gqa; ++g) {
-                const int bh = hkv * gqa + g;
-                memcpy(v_buf + ((size_t) bh * n_kv + kt) * D, src, (size_t) D * sizeof(float));
+                memcpy(k_buf + ((size_t) (bh - bh_start) * n_kv + kt) * D,
+                       src,
+                       (size_t) D * sizeof(float));
             }
         }
     }
 
-    // ---- Mask ----
-    // kq_mask shape is [n_kv, n_q, 1, 1] F32 contiguous, written by
-    // set_input_kq_mask. The provider's `mask` is [n_q * n_kv] row-major
-    // with q as the outer index, which matches mask[q*n_kv + kv] — exactly
-    // the storage of an [n_kv, n_q] tensor in ggml.
-    const float * mask_data = NULL;
-    if (kq_mask != NULL && kq_mask->data != NULL) {
-        GGML_ASSERT(kq_mask->type == GGML_TYPE_F32 && "TurboQuant op: kq_mask must be F32");
-        mask_data = (const float *) kq_mask->data;
+    // ---- Pack V slice: layout depends on v_trans ----
+    float * v_buf = (float *) malloc((size_t) bh_count * n_kv * D * sizeof(float));
+    GGML_ASSERT(v_buf && "TurboQuant op: v_buf alloc failed");
+    {
+        float src[1024];
+        for (int kt = 0; kt < n_kv; ++kt) {
+            int last_hkv = -1;
+            for (int bh = bh_start; bh < bh_end; ++bh) {
+                const int hkv = bh / gqa;
+                if (hkv != last_hkv) {
+                    for (int d = 0; d < D; ++d) {
+                        size_t off;
+                        if (v_trans) {
+                            off = (size_t) kt  * v->nb[0]
+                                + (size_t) hkv * v->nb[1]
+                                + (size_t) d   * v->nb[2];
+                        } else {
+                            off = (size_t) d   * v->nb[0]
+                                + (size_t) hkv * v->nb[1]
+                                + (size_t) kt  * v->nb[2];
+                        }
+                        src[d] = tq_read_elem(v, off);
+                    }
+                    last_hkv = hkv;
+                }
+                memcpy(v_buf + ((size_t) (bh - bh_start) * n_kv + kt) * D,
+                       src,
+                       (size_t) D * sizeof(float));
+            }
+        }
     }
 
-    // ---- Provider call ----
-    float * out_buf = (float *) malloc((size_t) BH * n_q * D * sizeof(float));
+    // ---- Provider call for this thread's BH slice ----
+    float * out_buf = (float *) malloc((size_t) bh_count * n_q * D * sizeof(float));
     GGML_ASSERT(out_buf && "TurboQuant op: out_buf alloc failed");
 
     fn(q_buf, k_buf, v_buf,
-       BH, n_q, n_kv, D,
+       bh_count, n_q, n_kv, D,
        ud->scale, mask_data,
        out_buf);
 
-    // ---- Permute output back to dst layout [D, n_head, n_q] (contiguous F32) ----
-    // dst is allocated by ggml_custom_4d as a fresh contiguous F32 tensor
-    // with q's shape, so we can index it as dst_data[t*n_head*D + h*D + d].
+    // ---- Write back to dst slice [D, n_head, n_q] ----
+    // dst is contiguous F32 with q's shape, so dst[d, h, t] is at
+    // ((t * n_head + h) * D + d). Each thread writes only h ∈ [bh_start, bh_end),
+    // which is disjoint from other threads' slices.
     GGML_ASSERT(dst->type == GGML_TYPE_F32 && "TurboQuant op: dst must be F32");
     GGML_ASSERT(ggml_is_contiguous(dst) && "TurboQuant op: dst must be contiguous");
     float * dst_data = (float *) dst->data;
     for (int t = 0; t < n_q; ++t) {
-        for (int h = 0; h < n_head; ++h) {
-            const float * src = out_buf + ((size_t) h * n_q + t) * D;
+        for (int bh = bh_start; bh < bh_end; ++bh) {
+            const int h = bh;
+            const float * src = out_buf + ((size_t) (bh - bh_start) * n_q + t) * D;
             float       * row = dst_data + ((size_t) t * n_head + h) * D;
             memcpy(row, src, (size_t) D * sizeof(float));
         }
