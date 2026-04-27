@@ -23,6 +23,7 @@
 // patch lands. The full include happens in llama-graph.cpp; the symbol
 // resolves at link time against libllama.
 typedef void (*llama_turboquant_attn_fn)(
+        const void * session, int layer_il,
         const float * q, const float * k, const float * v,
         int BH, int n_q, int n_kv, int D,
         float scale, const float * mask, float * out);
@@ -32,11 +33,18 @@ extern llama_turboquant_attn_fn llama_get_turboquant_attn_fn(void);
 // Userdata layout. Allocated by llama-graph.cpp via ggml_new_buffer so it
 // lives as long as the graph context (i.e. until compute completes).
 //
+// session is the kv_cache_turboquant instance pointer — stable across
+// decode calls for the same model, used by the provider to cache
+// prepared K-state on GPU (P2.1c Phase A2). layer_il is the layer
+// index (0..n_layer-1).
+//
 // Mask data is NOT captured here — it lives at dst->src[3]->data and is
 // only valid at execute time, after the graph allocator has run. Capturing
 // it at graph-build time gives a stale / null pointer.
 struct ggml_turboquant_userdata {
-    float scale;
+    float        scale;
+    const void * session;     // opaque: kv_cache_turboquant *
+    int          layer_il;    // 0..n_layer-1
 };
 
 // Forward declaration for -Wmissing-prototypes; the real consumer is the
@@ -142,16 +150,38 @@ void ggml_custom_op_turboquant_attn(
     const int gqa = n_head / n_head_kv;
     const int BH  = n_head_kv * gqa;  // == n_head
 
-    // ---- Per-thread BH partition ----
-    // bh ∈ [bh_start, bh_end) is this worker's slice. The mapping bh -> hkv
-    // is bh / gqa; each bh corresponds to one Q head and one (replicated)
-    // KV head. dst slices along n_head are disjoint per thread, so no
-    // synchronization is needed when writing back.
-    const int bh_start = (BH * ith) / nth;
-    const int bh_end   = (BH * (ith + 1)) / nth;
-    const int bh_count = bh_end - bh_start;
-    if (bh_count <= 0) {
-        return; // nth > BH: extra threads no-op
+    // ---- BH partition strategy ----
+    //
+    // Two cases:
+    //
+    //   Stateless (ud->session == NULL): each worker handles a disjoint
+    //   slice of BH, calls the provider with bh_count, writes its slice
+    //   of dst. Maximum CPU parallelism for the data shuffle.
+    //
+    //   Session-cached (ud->session != NULL, Phase A2): the libturboquant
+    //   session cache holds one TurboQuantKVCache per (session, layer)
+    //   covering the FULL BH. If we partitioned by ith, thread 0 would
+    //   prefill the cache with its BH slice (e.g. heads [0..8)) and
+    //   thread 1 would then call append() on that cache with a different
+    //   slice (heads [8..16)) — the cache class throws on the BH/shape
+    //   mismatch (SIGILL via __cxa_throw on Android, since exceptions
+    //   escape the noexcept ggml callback). Solution: only ith=0 runs;
+    //   it processes the full BH; other workers no-op. We lose the 4×
+    //   shuffle parallelism, but the session cache amortizes the
+    //   rotate+quantize cost across all decode steps so it's a net win.
+    int bh_start, bh_end, bh_count;
+    if (ud->session != NULL) {
+        if (ith != 0) return;
+        bh_start = 0;
+        bh_end   = BH;
+        bh_count = BH;
+    } else {
+        bh_start = (BH * ith) / nth;
+        bh_end   = (BH * (ith + 1)) / nth;
+        bh_count = bh_end - bh_start;
+        if (bh_count <= 0) {
+            return; // nth > BH: extra threads no-op
+        }
     }
 
     // Mask. F32, contiguous, shared read-only across threads.
@@ -246,7 +276,8 @@ void ggml_custom_op_turboquant_attn(
     float * out_buf = (float *) malloc((size_t) bh_count * n_q * D * sizeof(float));
     GGML_ASSERT(out_buf && "TurboQuant op: out_buf alloc failed");
 
-    fn(q_buf, k_buf, v_buf,
+    fn(ud->session, ud->layer_il,
+       q_buf, k_buf, v_buf,
        bh_count, n_q, n_kv, D,
        ud->scale, mask_data,
        out_buf);
