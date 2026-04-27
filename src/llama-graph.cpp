@@ -29,7 +29,9 @@
 // it, llama_kv_cache::set_input_kq_mask faults at decode time.
 extern "C" {
     struct ggml_turboquant_userdata {
-        float scale;
+        float        scale;
+        const void * session;
+        int          layer_il;
     };
 
     void ggml_custom_op_turboquant_attn(
@@ -1987,7 +1989,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 // GGML_OBJECT_TYPE_WORK_BUFFER allocation.
                 auto * ud = (struct ggml_turboquant_userdata *)
                     ggml_new_buffer(ctx0, sizeof(struct ggml_turboquant_userdata));
-                ud->scale = kq_scale;
+                ud->scale    = kq_scale;
+                // session is the kv_cache_turboquant instance pointer —
+                // stable across decode calls for the same model. Used by
+                // the provider to cache prepared K-state on GPU.
+                ud->session  = static_cast<const void *>(kv_tq);
+                ud->layer_il = il;
 
                 ggml_tensor * args[4] = { q, k, v, kq_mask };
                 const int n_args = (kq_mask != nullptr) ? 4 : 3;

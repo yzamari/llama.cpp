@@ -975,7 +975,15 @@ extern "C" {
     // TurboQuant attention provider hook (PolarQuant + 1-bit QJL).
     // The function is invoked by the custom ggml op when a TurboQuant cache
     // is in use. Pass NULL to deregister. Caller owns the function pointer.
+    //
+    // session is an opaque, per-(model,kv-cache) identity that lets the
+    // provider amortize K-side state across calls. It's stable across
+    // decode steps for the same model. layer_il is the transformer
+    // layer index (0..n_layer-1). When session is non-NULL the provider
+    // may cache prepared K/V state; when NULL the call is treated as
+    // stateless (every call rebuilds).
     typedef void (*llama_turboquant_attn_fn)(
+        const void * session, int layer_il,
         const float * q, const float * k, const float * v,
         int BH, int n_q, int n_kv, int D,
         float scale, const float * mask, float * out);
